@@ -43,7 +43,7 @@
 
 #define ENET_VERSION_MAJOR 2
 #define ENET_VERSION_MINOR 7
-#define ENET_VERSION_PATCH 0
+#define ENET_VERSION_PATCH 1
 #define ENET_VERSION_CREATE(major, minor, patch) (((major)<<16) | ((minor)<<8) | (patch))
 #define ENET_VERSION_GET_MAJOR(version) (((version)>>16)&0xFF)
 #define ENET_VERSION_GET_MINOR(version) (((version)>>8)&0xFF)
@@ -56,6 +56,12 @@
 #define ENET_TIME_LESS_EQUAL(a, b) (! ENET_TIME_GREATER (a, b))
 #define ENET_TIME_GREATER_EQUAL(a, b) (! ENET_TIME_LESS (a, b))
 #define ENET_TIME_DIFFERENCE(a, b) ((a) - (b) >= ENET_TIME_OVERFLOW ? (b) - (a) : (a) - (b))
+
+/* How often a host sends the handshake answer (VERIFY_CONNECT) before it drops the
+ * half-open peer; the client repeats its CONNECT. See enet_protocol_check_timeouts. */
+#ifndef ENET_HANDSHAKE_ATTEMPTS
+#define ENET_HANDSHAKE_ATTEMPTS 2
+#endif
 
 // =======================================================================//
 // !
@@ -1544,11 +1550,13 @@ extern "C" {
     static int initializedCRC32 = 0;
     static enet_uint32 crcTable[256];
 
-    static enet_uint32 reflect_crc(int val, int bits) {
-        int result = 0, bit;
+    static enet_uint32 reflect_crc(enet_uint32 val, int bits) {
+        enet_uint32 result = 0;
+        int bit;
 
+        /* unsigned: "1 << 31" overflowed a signed int (undefined behaviour) */
         for (bit = 0; bit < bits; bit++) {
-            if (val & 1) { result |= 1 << (bits - 1 - bit); }
+            if (val & 1) { result |= 1u << (bits - 1 - bit); }
             val >>= 1;
         }
 
@@ -1875,6 +1883,21 @@ extern "C" {
         return commandNumber;
     } /* enet_protocol_remove_sent_reliable_command */
 
+    /* The packet throttle parameters come from the remote side unchecked (CONNECT,
+     * THROTTLE_CONFIGURE) - an acceleration near 2^32 wrapped the throttle around.
+     * Kept in sane ranges (defaults: interval 5000 ms, acceleration/deceleration 2 of 32). */
+    static void enet_protocol_clamp_throttle(ENetPeer *peer) {
+        if (peer->packetThrottleInterval > 60000) {
+            peer->packetThrottleInterval = 60000;
+        }
+        if (peer->packetThrottleAcceleration > ENET_PEER_PACKET_THROTTLE_SCALE) {
+            peer->packetThrottleAcceleration = ENET_PEER_PACKET_THROTTLE_SCALE;
+        }
+        if (peer->packetThrottleDeceleration > ENET_PEER_PACKET_THROTTLE_SCALE) {
+            peer->packetThrottleDeceleration = ENET_PEER_PACKET_THROTTLE_SCALE;
+        }
+    }
+
     static ENetPeer * enet_protocol_handle_connect(ENetHost *host, ENetProtocolHeader *header, ENetProtocol *command) {
         ENET_UNUSED(header)
 
@@ -1927,6 +1950,7 @@ extern "C" {
         peer->packetThrottleInterval     = ENET_NET_TO_HOST_32(command->connect.packetThrottleInterval);
         peer->packetThrottleAcceleration = ENET_NET_TO_HOST_32(command->connect.packetThrottleAcceleration);
         peer->packetThrottleDeceleration = ENET_NET_TO_HOST_32(command->connect.packetThrottleDeceleration);
+        enet_protocol_clamp_throttle(peer);
         peer->eventData                  = ENET_NET_TO_HOST_32(command->connect.data);
 
         incomingSessionID = command->connect.incomingSessionID == 0xFF ? peer->outgoingSessionID : command->connect.incomingSessionID;
@@ -2389,6 +2413,7 @@ extern "C" {
         peer->packetThrottleInterval     = ENET_NET_TO_HOST_32(command->throttleConfigure.packetThrottleInterval);
         peer->packetThrottleAcceleration = ENET_NET_TO_HOST_32(command->throttleConfigure.packetThrottleAcceleration);
         peer->packetThrottleDeceleration = ENET_NET_TO_HOST_32(command->throttleConfigure.packetThrottleDeceleration);
+        enet_protocol_clamp_throttle(peer);
 
         return 0;
     }
@@ -2601,6 +2626,12 @@ extern "C" {
         peerID   &= ~(ENET_PROTOCOL_HEADER_FLAG_MASK | ENET_PROTOCOL_HEADER_SESSION_MASK);
 
         headerSize = (flags & ENET_PROTOCOL_HEADER_FLAG_SENT_TIME ? sizeof(ENetProtocolHeader) : sizeof(ENetProtocolHeaderMinimal));
+
+        /* A datagram shorter than its own header: with compression on,
+         * "receivedDataLength - headerSize" wrapped around (out-of-bounds read). */
+        if (host->receivedDataLength < headerSize) {
+            return 0;
+        }
 
 #ifdef ENET_USE_MORE_PEERS
         if (flags & ENET_PROTOCOL_HEADER_FLAG_PEER_EXTRA) {
@@ -2967,10 +2998,20 @@ extern "C" {
                 peer->earliestTimeout = outgoingCommand->sentTime;
             }
 
-            if (peer->earliestTimeout != 0 &&
+            /* A peer still in the handshake gets its VERIFY_CONNECT at most
+             * ENET_HANDSHAKE_ATTEMPTS times - a CONNECT with a forged sender address
+             * otherwise made the host send it again and again to that address
+             * (reflection amplification). A real client repeats its CONNECT and
+             * gets a fresh answer.
+             * "1u << (sendAttempts - 1)" is bounded: from 33 attempts on (reachable with
+             * the linear backoff and a low RTT) the shift was undefined behaviour. */
+            if ((peer->state == ENET_PEER_STATE_ACKNOWLEDGING_CONNECT &&
+                outgoingCommand->sendAttempts >= ENET_HANDSHAKE_ATTEMPTS) ||
+                (peer->earliestTimeout != 0 &&
                 (ENET_TIME_DIFFERENCE(host->serviceTime, peer->earliestTimeout) >= peer->timeoutMaximum ||
-                ((1u << (outgoingCommand->sendAttempts - 1)) >= peer->timeoutLimit &&
-                ENET_TIME_DIFFERENCE(host->serviceTime, peer->earliestTimeout) >= peer->timeoutMinimum))
+                ((outgoingCommand->sendAttempts > 32 ||
+                  (1u << (outgoingCommand->sendAttempts > 0 ? outgoingCommand->sendAttempts - 1 : 0)) >= peer->timeoutLimit) &&
+                ENET_TIME_DIFFERENCE(host->serviceTime, peer->earliestTimeout) >= peer->timeoutMinimum)))
             ) {
                 enet_protocol_notify_disconnect_timeout(host, peer, event);
                 return 1;
@@ -4489,6 +4530,13 @@ extern "C" {
         packet = callbacks.packet_create(data, dataLength, flags);
         if (packet == NULL) {
             goto notifyError;
+        }
+
+        /* A fragmented packet starts empty (data NULL). Fragments with overlapping
+         * offsets could complete it with gaps never written - the application then
+         * got old heap memory as message bytes. Zeroed instead. */
+        if (data == NULL && dataLength > 0 && packet->data != NULL) {
+            memset(packet->data, 0, dataLength);
         }
 
         incomingCommand = (ENetIncomingCommand *) enet_malloc(sizeof(ENetIncomingCommand));

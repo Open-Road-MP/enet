@@ -1,59 +1,76 @@
 <div align="center">
-    <a href="https://github.com/zpl-c/enet"><img src="https://user-images.githubusercontent.com/2182108/111983468-d5593e80-8b12-11eb-9c59-8c78ecc0504e.png" alt="zpl/enet" /></a>
+    <img src="https://img.shields.io/github/package-json/v/Open-Road-MP/enet?style=for-the-badge" alt="version" />
+    <a href="LICENSE"><img src="https://img.shields.io/github/license/Open-Road-MP/enet?style=for-the-badge" alt="license" /></a>
 </div>
 
 <br />
 
 <div align="center">
-    <a href="https://github.com/zpl-c/enet/actions"><img src="https://img.shields.io/github/actions/workflow/status/zpl-c/enet/tests.yml?branch=master&label=Tests&style=for-the-badge" alt="build status" /></a>
-    <img src="https://img.shields.io/github/package-json/v/zpl-c/enet?style=for-the-badge" alt="version" /></a>
-    <a href="https://discord.gg/2fZVEym"><img src="https://img.shields.io/discord/354670964400848898?color=7289DA&style=for-the-badge" alt="discord" /></a>
-    <a href="LICENSE"><img src="https://img.shields.io/github/license/zpl-c/enet?style=for-the-badge" alt="license" /></a>
-</div>
-
-<br />
-
-<div align="center">
-  ENet - Simple, lightweight and reliable UDP networking library written on pure C
+  ENet - Simple, lightweight and reliable UDP networking library written in pure C
 </div>
 
 <div align="center">
   <sub>
-    Brought to you by 
-    <a href="https://github.com/lsalzman">@lsalzman</a>,
+    Maintained by the <a href="https://openroadmp.com">Open Road MP</a> team.
+    Based on the work of
+    <a href="https://github.com/lsalzman">@lsalzman</a> (original ENet),
     <a href="https://github.com/inlife">@inlife</a>,
     <a href="https://github.com/zpl-zak">@zpl-zak</a>,
     <a href="https://github.com/nxrighthere">@nxrighthere</a>
-    and other <a href="https://github.com/zpl-c/enet/graphs/contributors">contributors</a>
+    and the contributors of <a href="https://github.com/zpl-c/enet">zpl-c/enet</a>.
   </sub>
 </div>
 
-## Disclaimer
+## About this fork
 
-This is a fork of the original library [lsalzman/enet](https://github.com/lsalzman/enet). While original repo offers a stable, time-tested wonderful library,
-we are trying to change some things, things, which can't be reflected on the main repo, like:
+This is the ENet used by [Open Road MP](https://openroadmp.com), a multiplayer mod for Euro Truck Simulator 2
+where anyone can host their own server. The game connection between client and server runs over ENet, on
+servers that are open to the internet. So we optimize and maintain this library as part of Open Road MP,
+with a focus on robustness against hostile traffic, and we keep it usable for everyone else.
 
-* integrated ipv6 support
-* added monotonic time
-* applied project-wide code style change
-* cleaned up project
-* single-header style code
-* removed some of older/outdated methods
-* and many other various changes
+It is based on [zpl-c/enet](https://github.com/zpl-c/enet) (single header, IPv6, monotonic time), which in turn is
+a fork of the original [lsalzman/enet](https://github.com/lsalzman/enet). The API stays compatible with zpl-c/enet;
+our changes are bug and security fixes, listed below and in [misc/ChangeLog](misc/ChangeLog).
 
-## Description
+## Security fixes (2.7.1)
 
-ENet's purpose is to provide a relatively thin, simple and robust network communication
-layer on top of UDP (User Datagram Protocol). The primary feature it provides is optional
-reliable, in-order delivery of packets, and fragmentation.
+| Area | Problem | Fix |
+|---|---|---|
+| Handshake | A `CONNECT` with a forged sender address made the host send its `VERIFY_CONNECT` again and again to that address: a reflection amplifier. | The answer goes out at most `ENET_HANDSHAKE_ATTEMPTS` (2) times, then the half-open peer is dropped. A real client repeats its `CONNECT` and gets a fresh answer. |
+| Timeouts | `1u << (sendAttempts - 1)` is undefined behaviour from 33 attempts on, which the linear backoff reaches with a low RTT. | The shift is bounded. |
+| CRC32 | `reflect_crc` shifted `1 << 31` on a signed `int` (undefined behaviour). | Unsigned arithmetic. |
+| Receiving | A datagram shorter than its own header (sent-time flag on 2-3 bytes) made the decompressor read with a length that wrapped around. | Such datagrams are dropped. |
+| Fragments | A fragmented packet could be completed with gaps that were never written (overlapping fragment offsets). The application then got old heap memory as message bytes. | Reassembly buffers start zeroed. |
+| Throttle | The packet throttle parameters from `CONNECT` and `THROTTLE_CONFIGURE` were taken unchecked. An acceleration near 2^32 wrapped the throttle around. | Clamped: interval at most 60 s, acceleration and deceleration at most `ENET_PEER_PACKET_THROTTLE_SCALE`. |
 
-ENet omits certain higher level networking features such as authentication, lobbying,
-server discovery, encryption, or other similar tasks that are particularly application
-specific so that the library remains flexible, portable, and easily embeddable.
+## Recommended settings for public servers
+
+ENet does not authenticate datagrams by itself. These settings are not defaults (they would change the
+behaviour of existing applications), but we recommend them for anything reachable from the internet:
+
+```c
+ENetHost *host = enet_host_create(&address, maxPeers, channels, 0, 0);
+
+/* A CRC32 seeded with the random connectID of each connection: someone who cannot
+ * see the traffic cannot inject packets (for example a DISCONNECT with a player's
+ * address). Both ends must set it - it changes the datagram layout. */
+host->checksum = enet_crc32;
+
+/* The defaults allow 32 MB per packet and 32 MB of buffered data per peer, so a
+ * few connections can make a server allocate gigabytes. Size them to your messages. */
+host->maximumPacketSize  = 256 * 1024;
+host->maximumWaitingData = 1024 * 1024;
+
+/* Connections per IP address (default: unlimited). */
+host->duplicatePeers = 8;
+```
+
+Also close connections on your side that never authenticate: ENet keeps an idle peer alive for as long as it
+answers pings, so one host could hold all slots of your server.
 
 ## Installation
 
-Download file [releases/latest/enet.h](https://github.com/zpl-c/enet/releases/latest/download/enet.h) and just add to your project.
+Copy [include/enet.h](include/enet.h) into your project.
 
 ## Usage (Shared library)
 
@@ -275,7 +292,7 @@ int main() {
 
 ## Tutorials
 
-More information, examples and tutorials can be found at the official site: http://enet.bespin.org/
+More information, examples and tutorials can be found at the site of the original ENet: http://enet.bespin.org/
 
 
 

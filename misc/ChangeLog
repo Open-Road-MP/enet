@@ -1,3 +1,12 @@
+ENet 2.7.1 (Open Road MP, October 15, 2026):
+* handshake: VERIFY_CONNECT sent at most ENET_HANDSHAKE_ATTEMPTS (2) times - no reflection amplification with forged CONNECTs
+* check_timeouts: bounded 1u << (sendAttempts - 1), undefined behaviour from 33 attempts on (zpl-c/enet PR 90)
+* reflect_crc: unsigned shifts, 1 << 31 on a signed int was undefined behaviour (zpl-c/enet PR 90)
+* datagrams shorter than their own header are dropped (decompressor length underflow)
+* reassembly buffers of fragmented packets start zeroed - no old heap memory in gaps
+* packet throttle parameters from the remote side clamped (CONNECT, THROTTLE_CONFIGURE)
+* README: maintained by Open Road MP, recommended settings for public servers
+
 ENet 2.0.0 (April 22, 2018):
 * changed library format to single header
 * applied project-wide code style change
